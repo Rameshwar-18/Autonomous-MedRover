@@ -11,19 +11,20 @@ import OrdersPage       from './pages/OrdersPage'
 import AdminPage        from './pages/AdminPage'
 import LoginPage        from './pages/LoginPage'
 
+import OfflineBanner   from './components/OfflineBanner'
+
 function App() {
   return (
     <AuthProvider>
+      <OfflineBanner />
       <Routes>
         {/* ── Public routes ─────────────────────────────────── */}
         <Route path="/"      element={<HomePage />}   />
         <Route path="/search" element={<SearchPage />} />
         <Route path="/login"  element={<LoginPage />}  />
 
-        {/* ── Protected routes — require login ──────────────── */}
-        <Route path="/admin" element={
-          <ProtectedRoute><AdminPage /></ProtectedRoute>
-        } />
+        {/* ── Admin — self-contained gate (hardcoded credentials) ── */}
+        <Route path="/admin" element={<AdminPage />} />
         <Route path="/cart" element={
           <ProtectedRoute><CartPage /></ProtectedRoute>
         } />

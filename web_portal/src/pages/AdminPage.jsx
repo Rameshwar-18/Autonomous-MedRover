@@ -1,7 +1,15 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { useAuth } from '../contexts/AuthContext'
 import { supabase } from '../lib/supabaseClient'
+import {
+  cacheOrders,
+  getCachedOrders,
+  updateCachedOrderStatus,
+  removeCachedOrder,
+  getActiveDelivery,
+  cacheActiveDelivery,
+} from '../lib/deliveryCache'
+import { enqueue } from '../lib/syncQueue'
 
 
 // â”€â”€ Status helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -106,8 +114,8 @@ function OverviewTab() {
 // ORDERS TAB
 // ——————————————————————————————————————————————————————————————————————————————
 function OrdersTab() {
-  const [orders,     setOrders]     = useState([])
-  const [loading,    setLoading]    = useState(true)
+  const [orders,     setOrders]     = useState(getCachedOrders)
+  const [loading,    setLoading]    = useState(false)
   const [error,      setError]      = useState('')
   const [filter,     setFilter]     = useState('all')
   const [search,     setSearch]     = useState('')
@@ -115,42 +123,92 @@ function OrdersTab() {
   const [deletingId, setDeletingId] = useState(null)
 
   const fetchOrders = useCallback(async () => {
-    if (!supabase) return
+    // 1. Instant load from local cache memory
+    const cached = getCachedOrders()
+    if (cached && cached.length > 0) {
+      setOrders(cached)
+    }
+
+    if (!supabase || !navigator.onLine) {
+      return
+    }
+
     setLoading(true); setError('')
     try {
       const { data, error: err } = await supabase
         .from('orders').select('*').order('created_at', { ascending: false })
-      if (err) { setError('Could not load orders from database.'); return }
+      if (err) {
+        if (!cached || cached.length === 0) {
+          setError('Could not load orders from database.')
+        }
+        return
+      }
       setOrders(data || [])
-    } catch { setError('Unexpected network error.') }
-    finally { setLoading(false) }
+      cacheOrders(data || [])
+    } catch {
+      if (!cached || cached.length === 0) {
+        setError('Unexpected network error. Displaying cached orders if available.')
+      }
+    } finally {
+      setLoading(false)
+    }
   }, [])
 
   useEffect(() => { fetchOrders() }, [fetchOrders])
 
   const handleStatusChange = async (id, newStatus) => {
-    if (!supabase) return
     setUpdatingId(id)
+
+    // 1. Immediately update cache memory & optimistic UI
+    const updated = updateCachedOrderStatus(id, newStatus)
+    setOrders(updated)
+
+    // 2. If offline or no supabase, enqueue for background sync
+    if (!supabase || !navigator.onLine) {
+      enqueue('UPDATE_ORDER_STATUS', { orderId: id, status: newStatus })
+      setUpdatingId(null)
+      return
+    }
+
     try {
       const { error: err } = await supabase.from('orders').update({ status: newStatus }).eq('id', id)
-      if (!err) setOrders(p => p.map(o => o.id === id ? { ...o, status: newStatus } : o))
-      else alert('Update failed.')
-    } catch { alert('Error.') }
-    finally { setUpdatingId(null) }
+      if (err) {
+        // Enqueue if database returned error or dropped connection
+        enqueue('UPDATE_ORDER_STATUS', { orderId: id, status: newStatus })
+      }
+    } catch {
+      enqueue('UPDATE_ORDER_STATUS', { orderId: id, status: newStatus })
+    } finally {
+      setUpdatingId(null)
+    }
   }
 
   const handleDelete = async (order) => {
     if (!window.confirm(`Delete Order #${order.id}? This is permanent.`)) return
-    if (!supabase) return
-    const prev = orders
     setDeletingId(order.id)
+
+    // 1. Update cache memory & optimistic UI
+    removeCachedOrder(order.id)
     setOrders(c => c.filter(o => o.id !== order.id))
+
+    // 2. If offline, enqueue
+    if (!supabase || !navigator.onLine) {
+      enqueue('DELETE_ORDER', { orderId: order.id })
+      setDeletingId(null)
+      return
+    }
+
     try {
       await supabase.from('order_items').delete().eq('order_id', order.id)
       const { error: err } = await supabase.from('orders').delete().eq('id', order.id)
-      if (err) { setOrders(prev); alert('Delete failed.') }
-    } catch { setOrders(prev) }
-    finally { setDeletingId(null) }
+      if (err) {
+        enqueue('DELETE_ORDER', { orderId: order.id })
+      }
+    } catch {
+      enqueue('DELETE_ORDER', { orderId: order.id })
+    } finally {
+      setDeletingId(null)
+    }
   }
 
   const filtered = orders.filter(o => {
@@ -491,12 +549,23 @@ function MedicinesTab() {
 // ROBOT TAB
 // ——————————————————————————————————————————————————————————————————————————————
 function RobotTab() {
-  const [active,  setActive]  = useState(null)
-  const [recent,  setRecent]  = useState([])
-  const [loading, setLoading] = useState(true)
+  const [active,  setActive]  = useState(getActiveDelivery)
+  const [recent,  setRecent]  = useState(() => getCachedOrders().slice(0, 8))
+  const [loading, setLoading] = useState(false)
 
   const fetchStatus = useCallback(async () => {
-    if (!supabase) return
+    // 1. Check local delivery cache memory first
+    const cachedActive = getActiveDelivery()
+    if (cachedActive) setActive(cachedActive)
+    const cachedOrders = getCachedOrders()
+    if (cachedOrders && cachedOrders.length > 0) {
+      setRecent(cachedOrders.slice(0, 8))
+    }
+
+    if (!supabase || !navigator.onLine) {
+      return
+    }
+
     setLoading(true)
     try {
       const [aRes, rRes] = await Promise.all([
@@ -505,10 +574,17 @@ function RobotTab() {
         supabase.from('orders').select('*')
           .order('created_at',{ascending:false}).limit(8),
       ])
-      setActive(aRes.data?.[0] || null)
+      const activeOrd = aRes.data?.[0] || null
+      setActive(activeOrd)
+      if (activeOrd) {
+        cacheActiveDelivery(activeOrd)
+      }
       setRecent(rRes.data || [])
-    } catch(e){ console.error(e) }
-    finally { setLoading(false) }
+    } catch(e) {
+      console.error(e)
+    } finally {
+      setLoading(false)
+    }
   }, [])
 
   useEffect(() => { fetchStatus() }, [fetchStatus])
@@ -594,34 +670,353 @@ function RobotTab() {
   )
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// ROOT â€” Admin Page
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ——————————————————————————————————————————————————————————————————————————————
+// USERS TAB
+// ——————————————————————————————————————————————————————————————————————————————
+const USER_STATUS_META = {
+  pending  : { bg: '#fef9c3', color: '#854d0e', label: 'Pending'  },
+  approved : { bg: '#dcfce7', color: '#166534', label: 'Approved' },
+  rejected : { bg: '#fee2e2', color: '#991b1b', label: 'Rejected' },
+}
+
+function UserStatusBadge({ status }) {
+  const s = USER_STATUS_META[status] || { bg: '#f3f4f6', color: '#374151', label: status }
+  return (
+    <span className="admin-status-badge" style={{ background: s.bg, color: s.color }}>
+      {s.label}
+    </span>
+  )
+}
+
+function UsersTab() {
+  const [users,      setUsers]      = useState([])
+  const [loading,    setLoading]    = useState(true)
+  const [error,      setError]      = useState('')
+  const [filter,     setFilter]     = useState('all')
+  const [actionId,   setActionId]   = useState(null)
+
+  const fetchUsers = useCallback(async () => {
+    if (!supabase) return
+    setLoading(true); setError('')
+    try {
+      // Use SECURITY DEFINER RPC to bypass RLS (admin has no Supabase session)
+      const { data, error: err } = await supabase.rpc('admin_get_all_users')
+      if (err) { setError('Could not load users: ' + err.message); return }
+      setUsers(data || [])
+    } catch { setError('Unexpected network error.') }
+    finally { setLoading(false) }
+  }, [])
+
+  useEffect(() => { fetchUsers() }, [fetchUsers])
+
+  const setStatus = async (id, status) => {
+    if (!supabase) return
+    setActionId(id)
+    try {
+      // Use SECURITY DEFINER RPC to bypass RLS for update
+      const { error: err } = await supabase.rpc('admin_set_user_status', {
+        target_id: id,
+        new_status: status,
+      })
+      if (!err) setUsers(p => p.map(u => u.id === id ? { ...u, approval_status: status } : u))
+      else alert('Action failed: ' + err.message)
+    } catch { alert('Error.') }
+    finally { setActionId(null) }
+  }
+
+  const filtered = filter === 'all' ? users : users.filter(u => u.approval_status === filter)
+
+  const pendingCount = users.filter(u => u.approval_status === 'pending').length
+
+  const fmt = (d) => new Date(d).toLocaleString('en-IN', {
+    day: '2-digit', month: 'short', year: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+  })
+
+  return (
+    <div>
+      <div className="admin-tab-header">
+        <div>
+          <h4 className="admin-tab-title">User Approvals</h4>
+          <p className="admin-tab-subtitle">
+            {users.length} registered user{users.length !== 1 ? 's' : ''}
+            {pendingCount > 0 && (
+              <span style={{ marginLeft: 8, background: '#fef9c3', color: '#854d0e',
+                padding: '1px 8px', borderRadius: 99, fontSize: '0.78rem', fontWeight: 600 }}>
+                {pendingCount} pending
+              </span>
+            )}
+          </p>
+        </div>
+        <button className="admin-refresh-btn" onClick={fetchUsers}>
+          <i className="bi bi-arrow-clockwise" /> Refresh
+        </button>
+      </div>
+
+      <div className="admin-filter-row">
+        <div className="admin-filter-pills">
+          {[
+            { k: 'all',      l: 'All'      },
+            { k: 'pending',  l: 'Pending'  },
+            { k: 'approved', l: 'Approved' },
+            { k: 'rejected', l: 'Rejected' },
+          ].map(f => (
+            <button key={f.k}
+              className={`admin-filter-pill${filter === f.k ? ' active' : ''}`}
+              onClick={() => setFilter(f.k)}>
+              {f.l}
+              {f.k === 'pending' && pendingCount > 0 && (
+                <span style={{ marginLeft: 5, background: '#ef4444', color: '#fff',
+                  borderRadius: 99, padding: '0 5px', fontSize: '0.7rem', fontWeight: 700 }}>
+                  {pendingCount}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+        <span className="admin-count-label">{filtered.length} result{filtered.length !== 1 ? 's' : ''}</span>
+      </div>
+
+      {loading && <div className="admin-loading"><div className="admin-spinner" /><span>Loading users…</span></div>}
+      {error   && <div className="admin-error-msg"><i className="bi bi-exclamation-triangle-fill" /> {error}</div>}
+
+      {!loading && !error && (
+        <div className="admin-table-wrapper">
+          <table className="admin-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Email</th>
+                <th>Status</th>
+                <th>Registered</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.length === 0 ? (
+                <tr><td colSpan={5} className="admin-table-empty">
+                  <i className="bi bi-inbox me-2" />No users in this category.
+                </td></tr>
+              ) : filtered.map(u => (
+                 <tr key={u.id}>
+                  <td><strong>{u.full_name || <span style={{color:'#aab'}}>—</span>}</strong></td>
+                  <td style={{ color: '#4b6070' }}>{u.email}</td>
+                  <td><UserStatusBadge status={u.approval_status} /></td>
+                  <td className="admin-date-cell">{fmt(u.created_at)}</td>
+                  <td style={{ minWidth: 190 }}>
+                    <div className="admin-action-btns">
+                      {u.approval_status !== 'approved' && (
+                        <button
+                          className="user-action-approve"
+                          disabled={actionId === u.id}
+                          onClick={() => setStatus(u.id, 'approved')}
+                          title="Approve user"
+                        >
+                          <i className="bi bi-check-lg" /> Approve
+                        </button>
+                      )}
+                      {u.approval_status !== 'rejected' && (
+                        <button
+                          className="user-action-reject"
+                          disabled={actionId === u.id}
+                          onClick={() => setStatus(u.id, 'rejected')}
+                          title="Reject user"
+                        >
+                          <i className="bi bi-x-lg" /> Reject
+                        </button>
+                      )}
+                      {u.approval_status === 'approved' && (
+                        <button
+                          className="user-action-revoke"
+                          disabled={actionId === u.id}
+                          onClick={() => setStatus(u.id, 'pending')}
+                          title="Revoke access"
+                        >
+                          <i className="bi bi-slash-circle" /> Revoke
+                        </button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="admin-info-banner mt-4">
+        <i className="bi bi-info-circle-fill" style={{ flexShrink: 0 }} />
+        <span>
+          <strong>Approve</strong> a user to grant portal access.
+          <strong> Reject</strong> to deny access.
+          <strong> Revoke</strong> to suspend an approved user.
+          Users cannot log in until approved.
+        </span>
+      </div>
+    </div>
+  )
+}
+
+// ——————————————————————————————————————————————————————————————————————————————
+// ROOT — Admin Page
+// ——————————————————————————————————————————————————————————————————————————————
 const TABS = [
   { id: 'overview',  label: 'Overview',     icon: 'bi-grid-1x2'              },
   { id: 'orders',    label: 'Orders',        icon: 'bi-clipboard2-pulse'      },
   { id: 'medicines', label: 'Medicines',     icon: 'bi-capsule'               },
   { id: 'robot',     label: 'Robot Status',  icon: 'bi-robot'                 },
+  { id: 'users',     label: 'User Approvals', icon: 'bi-people'               },
 ]
 
-export default function AdminPage() {
+// ──────────────────────────────────────────────────────────────────────────────
+// ADMIN LOGIN GATE
+// Completely separate from the Supabase login page.
+// Credentials: email = "admin18", password = "admin@1234"
+// ──────────────────────────────────────────────────────────────────────────────
+const ADMIN_ID  = 'admin18'
+const ADMIN_PWD = 'admin@1234'
+const SESSION_KEY = 'medrover_admin_auth'
+
+function AdminLoginGate() {
+  const [authed,   setAuthed]   = useState(() => sessionStorage.getItem(SESSION_KEY) === 'true')
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [showPass, setShowPass] = useState(false)
+  const [error,    setError]    = useState('')
+  const [loading,  setLoading]  = useState(false)
+  const navigate = useNavigate()
+
+  const handleLogin = (e) => {
+    e.preventDefault()
+    setError('')
+    setLoading(true)
+    // Simulate a brief delay for UX
+    setTimeout(() => {
+      if (username.trim() === ADMIN_ID && password === ADMIN_PWD) {
+        sessionStorage.setItem(SESSION_KEY, 'true')
+        setAuthed(true)
+      } else {
+        setError('Invalid admin credentials. Please try again.')
+      }
+      setLoading(false)
+    }, 500)
+  }
+
+  const handleLogout = () => {
+    sessionStorage.removeItem(SESSION_KEY)
+    setAuthed(false)
+    setUsername('')
+    setPassword('')
+  }
+
+  if (authed) return <AdminDashboard onLock={handleLogout} />
+
+  return (
+    <div className="admin-gate-page">
+      <div className="admin-gate-card">
+
+        {/* Header */}
+        <div className="admin-gate-header">
+          <div className="admin-gate-icon">
+            <i className="bi bi-shield-lock-fill" />
+          </div>
+          <h2 className="admin-gate-title">Admin Access</h2>
+          <p className="admin-gate-sub">
+            This area is restricted to authorised administrators only.
+          </p>
+        </div>
+
+        {/* Form */}
+        <form onSubmit={handleLogin} className="admin-gate-form" noValidate>
+
+          <div className="admin-gate-field">
+            <label htmlFor="adminUser">Admin Username</label>
+            <div className={`admin-gate-input-wrap${error ? ' error' : ''}`}>
+              <i className="bi bi-person-badge" />
+              <input
+                id="adminUser"
+                type="text"
+                placeholder="Enter admin username"
+                autoComplete="username"
+                value={username}
+                onChange={e => { setUsername(e.target.value); setError('') }}
+                required
+              />
+            </div>
+          </div>
+
+          <div className="admin-gate-field">
+            <label htmlFor="adminPass">Password</label>
+            <div className={`admin-gate-input-wrap${error ? ' error' : ''}`}>
+              <i className="bi bi-key" />
+              <input
+                id="adminPass"
+                type={showPass ? 'text' : 'password'}
+                placeholder="Enter admin password"
+                autoComplete="current-password"
+                value={password}
+                onChange={e => { setPassword(e.target.value); setError('') }}
+                required
+              />
+              <button
+                type="button"
+                className="admin-gate-eye"
+                onClick={() => setShowPass(v => !v)}
+                tabIndex={-1}
+                aria-label={showPass ? 'Hide' : 'Show'}
+              >
+                <i className={`bi ${showPass ? 'bi-eye-slash' : 'bi-eye'}`} />
+              </button>
+            </div>
+          </div>
+
+          {error && (
+            <div className="admin-gate-error">
+              <i className="bi bi-exclamation-circle-fill" />
+              {error}
+            </div>
+          )}
+
+          <button
+            type="submit"
+            className="admin-gate-submit"
+            disabled={loading || !username || !password}
+          >
+            {loading
+              ? <><span className="admin-gate-spinner" /> Verifying…</>
+              : <><i className="bi bi-unlock-fill" /> Access Dashboard</>
+            }
+          </button>
+        </form>
+
+        {/* Back link */}
+        <button className="admin-gate-back" onClick={() => navigate('/')}>
+          <i className="bi bi-arrow-left" /> Back to portal
+        </button>
+
+        <p className="admin-gate-note">
+          <i className="bi bi-info-circle me-1" />
+          This is separate from the staff login page.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ADMIN DASHBOARD (shown after successful admin login)
+// ──────────────────────────────────────────────────────────────────────────────
+function AdminDashboard({ onLock }) {
   const [activeTab,   setActiveTab]   = useState('overview')
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [time,        setTime]        = useState(new Date())
-  const { signOut }                   = useAuth()
-  const navigate                      = useNavigate()
 
   useEffect(() => {
     const t = setInterval(() => setTime(new Date()), 30_000)
     return () => clearInterval(t)
   }, [])
 
-  const lock = async () => {
-    await signOut()
-    navigate('/login')
-  }
-
-  const tab  = TABS.find(t => t.id === activeTab)
+  const tab = TABS.find(t => t.id === activeTab)
 
   return (
     <div className="admin-layout">
@@ -653,7 +1048,7 @@ export default function AdminPage() {
             <i className="bi bi-arrow-left-circle" />
             <span>Back to Portal</span>
           </Link>
-          <button className="admin-nav-item admin-lock-btn" onClick={lock}>
+          <button className="admin-nav-item admin-lock-btn" onClick={onLock}>
             <i className="bi bi-lock" />
             <span>Lock Dashboard</span>
           </button>
@@ -695,9 +1090,13 @@ export default function AdminPage() {
           {activeTab === 'orders'    && <OrdersTab />}
           {activeTab === 'medicines' && <MedicinesTab />}
           {activeTab === 'robot'     && <RobotTab />}
+          {activeTab === 'users'     && <UsersTab />}
         </div>
       </main>
     </div>
   )
 }
+
+export default AdminLoginGate
+
 
